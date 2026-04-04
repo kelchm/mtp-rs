@@ -62,10 +62,19 @@ impl NusbTransport {
 
     /// List all available MTP devices with location IDs.
     pub fn list_mtp_devices() -> Result<Vec<UsbDeviceInfo>, crate::Error> {
+        Self::list_mtp_devices_with_known(&[])
+    }
+
+    /// List all available MTP devices, including additional devices identified
+    /// by the given VID/PID pairs.
+    ///
+    /// Devices matching the provided VID/PID pairs are included in the results
+    /// even if their USB descriptors don't match standard MTP class codes.
+    pub fn list_mtp_devices_with_known(known: &[(u16, u16)]) -> Result<Vec<UsbDeviceInfo>, crate::Error> {
         let devices = nusb::list_devices()
             .wait()
             .map_err(crate::Error::Usb)?
-            .filter(Self::is_mtp_device)
+            .filter(|dev| Self::is_mtp_device(dev, known))
             .map(|dev| {
                 let location_id = location_id_from_topology(&dev);
                 UsbDeviceInfo {
@@ -83,7 +92,16 @@ impl NusbTransport {
     }
 
     /// Check if a device info represents an MTP device.
-    fn is_mtp_device(dev: &nusb::DeviceInfo) -> bool {
+    ///
+    /// A device is considered MTP if it matches standard MTP class codes, has
+    /// an interface with the MTP endpoint layout, or matches one of the
+    /// consumer-provided VID/PID pairs.
+    fn is_mtp_device(dev: &nusb::DeviceInfo, known: &[(u16, u16)]) -> bool {
+        // Fast path: consumer-registered devices that may use non-standard descriptors.
+        if known.iter().any(|&(v, p)| v == dev.vendor_id() && p == dev.product_id()) {
+            return true;
+        }
+
         // Check device class/subclass/protocol at device level.
         if Self::is_mtp_class(dev.class(), dev.subclass(), dev.protocol()) {
             return true;
@@ -130,16 +148,18 @@ impl NusbTransport {
     /// Check if an interface descriptor looks like an MTP interface.
     ///
     /// Matches standard MTP class/subclass/protocol, and also vendor-specific
-    /// interfaces (class 0xFF) with non-standard subclass/protocol that have
-    /// the MTP endpoint layout (bulk IN + bulk OUT + interrupt IN). Some devices
-    /// like Amazon Kindle use vendor-specific descriptors while still speaking MTP.
+    /// or unspecified interfaces (class 0xFF or 0) with non-standard
+    /// subclass/protocol that have the MTP endpoint layout (bulk IN + bulk OUT
+    /// + interrupt IN). Some devices like Amazon Kindle use vendor-specific
+    /// descriptors while still speaking MTP, and others (like Microsoft Zune)
+    /// use class 0.
     fn is_mtp_interface(alt: &InterfaceDescriptor) -> bool {
         if Self::is_mtp_class(alt.class(), alt.subclass(), alt.protocol()) {
             return true;
         }
-        // For vendor-specific class, subclass and protocol are vendor-defined,
-        // so we can't rely on them. Use endpoint layout as a heuristic instead.
-        alt.class() == MTP_CLASS_VENDOR && Self::has_mtp_endpoint_layout(alt)
+        // For vendor-specific (0xFF) or unspecified (0) class, subclass and
+        // protocol are not reliable. Use endpoint layout as a heuristic instead.
+        (alt.class() == MTP_CLASS_VENDOR || alt.class() == 0) && Self::has_mtp_endpoint_layout(alt)
     }
 
     /// Check if an interface has the MTP endpoint layout:
@@ -169,10 +189,30 @@ impl NusbTransport {
         device: nusb::Device,
         timeout: Duration,
     ) -> Result<Self, crate::Error> {
-        // Find the MTP interface
-        let config = device.active_configuration().map_err(|e| {
-            crate::Error::invalid_data(format!("Failed to get configuration: {}", e))
-        })?;
+        // Find the MTP interface.
+        // Some devices aren't auto-configured by the OS. Try to get the active
+        // configuration, and if the device isn't configured yet, set
+        // configuration 1 (the standard USB default).
+        let config = match device.active_configuration() {
+            Ok(config) => config,
+            Err(_) => {
+                device
+                    .set_configuration(1)
+                    .wait()
+                    .map_err(|e| {
+                        crate::Error::invalid_data(format!(
+                            "Failed to set configuration: {}",
+                            e
+                        ))
+                    })?;
+                device.active_configuration().map_err(|e| {
+                    crate::Error::invalid_data(format!(
+                        "Failed to get configuration after set: {}",
+                        e
+                    ))
+                })?
+            }
+        };
 
         let mut mtp_interface_number = None;
         let mut bulk_in_addr = None;

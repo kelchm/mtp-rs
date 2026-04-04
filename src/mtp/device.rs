@@ -4,13 +4,55 @@ use crate::mtp::{DeviceEvent, Storage};
 use crate::ptp::{DeviceInfo, ObjectHandle, PtpSession, StorageId};
 use crate::transport::{NusbTransport, Transport};
 use crate::Error;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Device-specific protocol quirks that consumers can register for devices
+/// the library doesn't know about natively.
+///
+/// Some MTP devices have non-standard behavior that requires special handling.
+/// Instead of hardcoding device-specific workarounds, consumers can register
+/// quirks for devices they need to support.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use mtp_rs::mtp::{MtpDevice, DeviceQuirks};
+///
+/// # async fn example() -> Result<(), mtp_rs::Error> {
+/// let device = MtpDevice::builder()
+///     .register_device(0x045E, 0x0710, DeviceQuirks {
+///         split_header_data: true,
+///         manual_traversal: true,
+///     })
+///     .open_first()
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Default, Clone, Debug)]
+pub struct DeviceQuirks {
+    /// Send PTP header and payload as separate USB bulk transfers.
+    ///
+    /// When enabled, the 12-byte PTP container header and data payload are
+    /// sent as two separate USB bulk transfers instead of one combined transfer.
+    /// Required by some devices that can't handle combined header+data.
+    pub split_header_data: bool,
+
+    /// Use manual folder-by-folder traversal instead of native recursive listing.
+    ///
+    /// Some devices don't support the standard `ObjectHandle::ALL` recursive
+    /// listing. When enabled, the library will manually walk the folder tree
+    /// one level at a time.
+    pub manual_traversal: bool,
+}
 
 /// Internal shared state for MtpDevice.
 pub(crate) struct MtpDeviceInner {
     pub(crate) session: Arc<PtpSession>,
     pub(crate) device_info: DeviceInfo,
+    pub(crate) quirks: DeviceQuirks,
 }
 
 impl MtpDeviceInner {
@@ -25,6 +67,16 @@ impl MtpDeviceInner {
             .vendor_extension_desc
             .to_lowercase()
             .contains("android.com")
+    }
+
+    /// Check if the device needs manual recursive traversal instead of native
+    /// `ObjectHandle::ALL` listing.
+    ///
+    /// This is true for Android devices (detected automatically) and any device
+    /// whose registered [`DeviceQuirks`] has `manual_traversal` enabled.
+    #[must_use]
+    pub fn needs_manual_traversal(&self) -> bool {
+        self.is_android() || self.quirks.manual_traversal
     }
 }
 
@@ -89,7 +141,30 @@ impl MtpDevice {
 
     /// List all available MTP devices without opening them.
     pub fn list_devices() -> Result<Vec<MtpDeviceInfo>, Error> {
-        let devices = NusbTransport::list_mtp_devices()?;
+        Self::list_devices_with_known(&[])
+    }
+
+    /// List all available MTP devices, including additional devices identified
+    /// by the given VID/PID pairs.
+    ///
+    /// Devices matching the provided VID/PID pairs are included in the results
+    /// even if their USB descriptors don't match standard MTP class codes. This
+    /// is useful for devices with non-standard USB descriptors that still speak MTP.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use mtp_rs::mtp::MtpDevice;
+    ///
+    /// // Include a custom device in enumeration
+    /// let devices = MtpDevice::list_devices_with_known(&[
+    ///     (0x045E, 0x0710),
+    ///     (0x045E, 0x063E),
+    /// ])?;
+    /// # Ok::<(), mtp_rs::Error>(())
+    /// ```
+    pub fn list_devices_with_known(known: &[(u16, u16)]) -> Result<Vec<MtpDeviceInfo>, Error> {
+        let devices = NusbTransport::list_mtp_devices_with_known(known)?;
         #[allow(unused_mut)]
         let mut result: Vec<MtpDeviceInfo> = devices
             .into_iter()
@@ -113,6 +188,18 @@ impl MtpDevice {
     #[must_use]
     pub fn device_info(&self) -> &DeviceInfo {
         &self.inner.device_info
+    }
+
+    /// Get a reference to the underlying PTP session.
+    ///
+    /// This allows direct access to low-level PTP operations such as
+    /// `get_object_prop_value` and `set_object_prop_value` for querying
+    /// device-specific metadata (e.g., track play counts, artist info),
+    /// or vendor-specific PTP operations via `execute`, `execute_with_send`,
+    /// and `execute_with_receive`.
+    #[must_use]
+    pub fn session(&self) -> &PtpSession {
+        &self.inner.session
     }
 
     /// Check if the device supports renaming objects.
@@ -336,8 +423,33 @@ impl MtpDeviceInfo {
 }
 
 /// Builder for MtpDevice configuration.
+///
+/// Use [`MtpDevice::builder()`] to create an instance. The builder allows
+/// configuring timeouts and registering device-specific quirks before
+/// opening a device.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use mtp_rs::mtp::{MtpDevice, DeviceQuirks};
+/// use std::time::Duration;
+///
+/// # async fn example() -> Result<(), mtp_rs::Error> {
+/// let device = MtpDevice::builder()
+///     .timeout(Duration::from_secs(60))
+///     .register_device(0x045E, 0x0710, DeviceQuirks {
+///         split_header_data: true,
+///         manual_traversal: true,
+///     })
+///     .open_first()
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct MtpDeviceBuilder {
     timeout: Duration,
+    known_devices: HashMap<(u16, u16), DeviceQuirks>,
+    quirk_detector: Option<Box<dyn Fn(u16, u16) -> Option<DeviceQuirks> + Send + Sync>>,
 }
 
 impl MtpDeviceBuilder {
@@ -345,6 +457,8 @@ impl MtpDeviceBuilder {
     pub fn new() -> Self {
         Self {
             timeout: NusbTransport::DEFAULT_TIMEOUT,
+            known_devices: HashMap::new(),
+            quirk_detector: None,
         }
     }
 
@@ -358,12 +472,66 @@ impl MtpDeviceBuilder {
         self
     }
 
+    /// Register a device by VID/PID as an MTP device with specific quirks.
+    ///
+    /// Registered devices are included in enumeration even if their USB
+    /// descriptors don't match standard MTP class codes. The associated
+    /// quirks are applied automatically when the device is opened.
+    ///
+    /// Can be called multiple times to register different devices.
+    #[must_use]
+    pub fn register_device(mut self, vendor_id: u16, product_id: u16, quirks: DeviceQuirks) -> Self {
+        self.known_devices.insert((vendor_id, product_id), quirks);
+        self
+    }
+
+    /// Register a callback to detect quirks for arbitrary devices.
+    ///
+    /// Called during device opening with the device's VID and PID. Return
+    /// `Some(quirks)` to apply quirks, or `None` to use default behavior.
+    ///
+    /// This callback does **not** affect device enumeration — use
+    /// [`register_device`](Self::register_device) for that. The callback
+    /// is checked after explicit registrations, so registered devices
+    /// take priority.
+    #[must_use]
+    pub fn detect_quirks<F>(mut self, f: F) -> Self
+    where
+        F: Fn(u16, u16) -> Option<DeviceQuirks> + Send + Sync + 'static,
+    {
+        self.quirk_detector = Some(Box::new(f));
+        self
+    }
+
+    /// Resolve quirks for a device by VID/PID.
+    ///
+    /// Checks explicit registrations first, then the quirk detector callback.
+    /// Returns default (no quirks) if neither matches.
+    fn resolve_quirks(&self, vendor_id: u16, product_id: u16) -> DeviceQuirks {
+        if let Some(quirks) = self.known_devices.get(&(vendor_id, product_id)) {
+            return quirks.clone();
+        }
+        if let Some(detector) = &self.quirk_detector {
+            if let Some(quirks) = detector(vendor_id, product_id) {
+                return quirks;
+            }
+        }
+        DeviceQuirks::default()
+    }
+
+    /// Collect VID/PID pairs from registered devices for enumeration.
+    fn known_vid_pids(&self) -> Vec<(u16, u16)> {
+        self.known_devices.keys().copied().collect()
+    }
+
     /// Open the first available device.
     pub async fn open_first(self) -> Result<MtpDevice, Error> {
-        let devices = NusbTransport::list_mtp_devices()?;
+        let known = self.known_vid_pids();
+        let devices = NusbTransport::list_mtp_devices_with_known(&known)?;
         let device_info = devices.into_iter().next().ok_or(Error::NoDevice)?;
+        let quirks = self.resolve_quirks(device_info.vendor_id, device_info.product_id);
         let device = device_info.open().map_err(Error::Usb)?;
-        self.open_device(device).await
+        self.open_device(device, quirks).await
     }
 
     /// Open a device at a specific USB location (port).
@@ -378,13 +546,15 @@ impl MtpDeviceBuilder {
             return self.open_virtual(config).await;
         }
 
-        let devices = NusbTransport::list_mtp_devices()?;
+        let known = self.known_vid_pids();
+        let devices = NusbTransport::list_mtp_devices_with_known(&known)?;
         let device_info = devices
             .into_iter()
             .find(|d| d.location_id == location_id)
             .ok_or(Error::NoDevice)?;
+        let quirks = self.resolve_quirks(device_info.vendor_id, device_info.product_id);
         let device = device_info.open().map_err(Error::Usb)?;
-        self.open_device(device).await
+        self.open_device(device, quirks).await
     }
 
     /// Open a device by its serial number.
@@ -400,23 +570,32 @@ impl MtpDeviceBuilder {
             return self.open_virtual(config).await;
         }
 
-        let devices = NusbTransport::list_mtp_devices()?;
+        let known = self.known_vid_pids();
+        let devices = NusbTransport::list_mtp_devices_with_known(&known)?;
         let device_info = devices
             .into_iter()
             .find(|d| d.serial_number.as_deref() == Some(serial))
             .ok_or(Error::NoDevice)?;
+        let quirks = self.resolve_quirks(device_info.vendor_id, device_info.product_id);
         let device = device_info.open().map_err(Error::Usb)?;
-        self.open_device(device).await
+        self.open_device(device, quirks).await
     }
 
-    /// Internal: open an already-discovered device.
-    async fn open_device(self, device: nusb::Device) -> Result<MtpDevice, Error> {
+    /// Internal: open an already-discovered device with resolved quirks.
+    async fn open_device(self, device: nusb::Device, quirks: DeviceQuirks) -> Result<MtpDevice, Error> {
         // Open transport
         let transport = NusbTransport::open_with_timeout(device, self.timeout).await?;
         let transport: Arc<dyn Transport> = Arc::new(transport);
 
         // Open session (use session ID 1)
-        let session = Arc::new(PtpSession::open(transport.clone(), 1).await?);
+        let mut session = PtpSession::open(transport.clone(), 1).await?;
+
+        // Apply split header/data quirk before any data operations
+        if quirks.split_header_data {
+            session.set_split_header_data(true);
+        }
+
+        let session = Arc::new(session);
 
         // Get device info
         let device_info = session.get_device_info().await?;
@@ -424,6 +603,7 @@ impl MtpDeviceBuilder {
         let inner = Arc::new(MtpDeviceInner {
             session,
             device_info,
+            quirks,
         });
 
         Ok(MtpDevice { inner })
@@ -486,6 +666,7 @@ impl MtpDeviceBuilder {
         let inner = Arc::new(MtpDeviceInner {
             session,
             device_info,
+            quirks: DeviceQuirks::default(),
         });
 
         Ok(MtpDevice { inner })

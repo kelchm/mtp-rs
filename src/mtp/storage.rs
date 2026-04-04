@@ -261,17 +261,17 @@ impl Storage {
 
     /// List objects recursively.
     ///
-    /// This method automatically detects Android devices and uses manual traversal
-    /// for them, since Android's MTP implementation doesn't support the native
-    /// `ObjectHandle::ALL` recursive listing.
+    /// This method uses manual traversal for devices that need it (Android
+    /// devices and any device with [`DeviceQuirks::manual_traversal`](crate::mtp::DeviceQuirks)
+    /// enabled), since they don't support native `ObjectHandle::ALL` recursive listing.
     ///
-    /// For non-Android devices, it tries native recursive listing first and falls
+    /// For other devices, it tries native recursive listing first and falls
     /// back to manual traversal if the results look incomplete.
     pub async fn list_objects_recursive(
         &self,
         parent: Option<ObjectHandle>,
     ) -> Result<Vec<ObjectInfo>, Error> {
-        if self.inner.is_android() {
+        if self.inner.needs_manual_traversal() {
             return self.list_objects_recursive_manual(parent).await;
         }
 
@@ -560,6 +560,7 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mtp::device::DeviceQuirks;
     use crate::ptp::{
         pack_u16, pack_u32, pack_u32_array, ContainerType, DateTime, DeviceInfo, ObjectFormatCode,
         OperationCode, PtpSession, ResponseCode, StorageInfo,
@@ -620,6 +621,7 @@ mod tests {
                 vendor_extension_desc: vendor_extension_desc.to_string(),
                 ..DeviceInfo::default()
             },
+            quirks: DeviceQuirks::default(),
         });
         Storage::new(inner, StorageId(1), StorageInfo::default())
     }

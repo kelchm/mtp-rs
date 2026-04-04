@@ -38,7 +38,7 @@ mod object;
 mod storage;
 mod stream;
 
-pub use device::{MtpDevice, MtpDeviceBuilder, MtpDeviceInfo};
+pub use device::{DeviceQuirks, MtpDevice, MtpDeviceBuilder, MtpDeviceInfo};
 pub use event::DeviceEvent;
 pub use object::NewObjectInfo;
 pub use storage::{ObjectListing, Storage};

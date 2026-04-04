@@ -26,6 +26,19 @@ impl MtpDeviceInner {
             .to_lowercase()
             .contains("android.com")
     }
+
+    /// Check if the device needs manual recursive traversal instead of native
+    /// ObjectHandle::ALL listing. This applies to Android and Microsoft/Zune
+    /// devices which don't support native recursive listing reliably.
+    #[must_use]
+    pub fn needs_manual_traversal(&self) -> bool {
+        self.is_android()
+            || self
+                .device_info
+                .vendor_extension_desc
+                .to_lowercase()
+                .contains("microsoft.com")
+    }
 }
 
 /// An MTP device connection.
@@ -113,6 +126,16 @@ impl MtpDevice {
     #[must_use]
     pub fn device_info(&self) -> &DeviceInfo {
         &self.inner.device_info
+    }
+
+    /// Get a reference to the underlying PTP session.
+    ///
+    /// This allows direct access to low-level PTP operations such as
+    /// `get_object_prop_value` and `set_object_prop_value` for querying
+    /// device-specific metadata (e.g., track play counts, artist info).
+    #[must_use]
+    pub fn session(&self) -> &PtpSession {
+        &self.inner.session
     }
 
     /// Check if the device supports renaming objects.
@@ -338,6 +361,7 @@ impl MtpDeviceInfo {
 /// Builder for MtpDevice configuration.
 pub struct MtpDeviceBuilder {
     timeout: Duration,
+    split_header_data: bool,
 }
 
 impl MtpDeviceBuilder {
@@ -345,6 +369,7 @@ impl MtpDeviceBuilder {
     pub fn new() -> Self {
         Self {
             timeout: NusbTransport::DEFAULT_TIMEOUT,
+            split_header_data: false,
         }
     }
 
@@ -358,10 +383,22 @@ impl MtpDeviceBuilder {
         self
     }
 
+    /// Enable split header/data mode for sending data containers.
+    ///
+    /// When enabled, the 12-byte PTP container header and payload are sent
+    /// as separate USB bulk transfers. Required by some devices (e.g.,
+    /// Microsoft Zune) that don't handle combined header+data transfers.
+    #[must_use]
+    pub fn split_header_data(mut self, split: bool) -> Self {
+        self.split_header_data = split;
+        self
+    }
+
     /// Open the first available device.
-    pub async fn open_first(self) -> Result<MtpDevice, Error> {
+    pub async fn open_first(mut self) -> Result<MtpDevice, Error> {
         let devices = NusbTransport::list_mtp_devices()?;
         let device_info = devices.into_iter().next().ok_or(Error::NoDevice)?;
+        self.auto_detect_quirks(&device_info);
         let device = device_info.open().map_err(Error::Usb)?;
         self.open_device(device).await
     }
@@ -370,7 +407,7 @@ impl MtpDeviceBuilder {
     ///
     /// Use `MtpDevice::list_devices()` to get available location IDs.
     /// Also checks the virtual device registry when the `virtual-device` feature is enabled.
-    pub async fn open_by_location(self, location_id: u64) -> Result<MtpDevice, Error> {
+    pub async fn open_by_location(mut self, location_id: u64) -> Result<MtpDevice, Error> {
         #[cfg(feature = "virtual-device")]
         if let Some(config) =
             crate::transport::virtual_device::registry::find_virtual_config_by_location(location_id)
@@ -383,6 +420,7 @@ impl MtpDeviceBuilder {
             .into_iter()
             .find(|d| d.location_id == location_id)
             .ok_or(Error::NoDevice)?;
+        self.auto_detect_quirks(&device_info);
         let device = device_info.open().map_err(Error::Usb)?;
         self.open_device(device).await
     }
@@ -392,7 +430,7 @@ impl MtpDeviceBuilder {
     /// This identifies a specific physical device regardless of which USB port
     /// it's connected to. Also checks the virtual device registry when the
     /// `virtual-device` feature is enabled.
-    pub async fn open_by_serial(self, serial: &str) -> Result<MtpDevice, Error> {
+    pub async fn open_by_serial(mut self, serial: &str) -> Result<MtpDevice, Error> {
         #[cfg(feature = "virtual-device")]
         if let Some(config) =
             crate::transport::virtual_device::registry::find_virtual_config_by_serial(serial)
@@ -405,8 +443,16 @@ impl MtpDeviceBuilder {
             .into_iter()
             .find(|d| d.serial_number.as_deref() == Some(serial))
             .ok_or(Error::NoDevice)?;
+        self.auto_detect_quirks(&device_info);
         let device = device_info.open().map_err(Error::Usb)?;
         self.open_device(device).await
+    }
+
+    /// Auto-detect device quirks based on VID/PID.
+    fn auto_detect_quirks(&mut self, info: &crate::transport::UsbDeviceInfo) {
+        if NusbTransport::is_known_mtp_device(info.vendor_id, info.product_id) {
+            self.split_header_data = true;
+        }
     }
 
     /// Internal: open an already-discovered device.
@@ -416,7 +462,13 @@ impl MtpDeviceBuilder {
         let transport: Arc<dyn Transport> = Arc::new(transport);
 
         // Open session (use session ID 1)
-        let session = Arc::new(PtpSession::open(transport.clone(), 1).await?);
+        let mut session = PtpSession::open(transport.clone(), 1).await?;
+
+        if self.split_header_data {
+            session.set_split_header_data(true);
+        }
+
+        let session = Arc::new(session);
 
         // Get device info
         let device_info = session.get_device_info().await?;

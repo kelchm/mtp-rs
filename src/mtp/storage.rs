@@ -271,7 +271,7 @@ impl Storage {
         &self,
         parent: Option<ObjectHandle>,
     ) -> Result<Vec<ObjectInfo>, Error> {
-        if self.inner.is_android() {
+        if self.inner.needs_manual_traversal() {
             return self.list_objects_recursive_manual(parent).await;
         }
 

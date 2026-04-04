@@ -84,6 +84,13 @@ impl NusbTransport {
 
     /// Check if a device info represents an MTP device.
     fn is_mtp_device(dev: &nusb::DeviceInfo) -> bool {
+        // Known MTP devices that use non-standard USB descriptors.
+        // These devices are vendor-specific (class 0xFF) with subclass/protocol 0
+        // but speak MTP once you connect to the right interface.
+        if Self::is_known_mtp_device(dev.vendor_id(), dev.product_id()) {
+            return true;
+        }
+
         // Check device class/subclass/protocol at device level.
         if Self::is_mtp_class(dev.class(), dev.subclass(), dev.protocol()) {
             return true;
@@ -120,6 +127,23 @@ impl NusbTransport {
         false
     }
 
+    /// Check if a device is a known MTP device by VID/PID.
+    ///
+    /// Some devices (e.g., Microsoft Zune) use vendor-specific USB descriptors
+    /// that don't match standard MTP class codes, but still speak MTP.
+    /// These devices also typically require split header/data mode.
+    pub fn is_known_mtp_device(vendor_id: u16, product_id: u16) -> bool {
+        matches!(
+            (vendor_id, product_id),
+            // Microsoft Zune (various models)
+            (0x045E, 0x0710) | // Zune
+            (0x045E, 0x0711) | // Zune
+            (0x045E, 0x0712) | // Zune
+            (0x045E, 0x063E) | // Zune HD
+            (0x045E, 0x0714)   // Zune (alt)
+        )
+    }
+
     /// Check if class/subclass/protocol match standard MTP identifiers.
     fn is_mtp_class(class: u8, subclass: u8, protocol: u8) -> bool {
         (class == MTP_CLASS_IMAGE || class == MTP_CLASS_VENDOR)
@@ -137,9 +161,11 @@ impl NusbTransport {
         if Self::is_mtp_class(alt.class(), alt.subclass(), alt.protocol()) {
             return true;
         }
-        // For vendor-specific class, subclass and protocol are vendor-defined,
-        // so we can't rely on them. Use endpoint layout as a heuristic instead.
-        alt.class() == MTP_CLASS_VENDOR && Self::has_mtp_endpoint_layout(alt)
+        // For vendor-specific or unspecified class, subclass and protocol are
+        // vendor-defined, so we can't rely on them. Use endpoint layout as a
+        // heuristic instead. This catches devices like Amazon Kindle (class 0xFF)
+        // and Microsoft Zune (class 0) that speak MTP but don't advertise it.
+        (alt.class() == MTP_CLASS_VENDOR || alt.class() == 0) && Self::has_mtp_endpoint_layout(alt)
     }
 
     /// Check if an interface has the MTP endpoint layout:
@@ -169,10 +195,31 @@ impl NusbTransport {
         device: nusb::Device,
         timeout: Duration,
     ) -> Result<Self, crate::Error> {
-        // Find the MTP interface
-        let config = device.active_configuration().map_err(|e| {
-            crate::Error::invalid_data(format!("Failed to get configuration: {}", e))
-        })?;
+        // Find the MTP interface.
+        // Some devices (e.g., Zune) aren't auto-configured by the OS.
+        // Try to get the active configuration, and if the device isn't
+        // configured yet, set configuration 1 (the standard default).
+        let config = match device.active_configuration() {
+            Ok(config) => config,
+            Err(_) => {
+                // Device not configured (common for vendor-specific devices like Zune)
+                device
+                    .set_configuration(1)
+                    .wait()
+                    .map_err(|e| {
+                        crate::Error::invalid_data(format!(
+                            "Failed to set configuration: {}",
+                            e
+                        ))
+                    })?;
+                device.active_configuration().map_err(|e| {
+                    crate::Error::invalid_data(format!(
+                        "Failed to get configuration after set: {}",
+                        e
+                    ))
+                })?
+            }
+        };
 
         let mut mtp_interface_number = None;
         let mut bulk_in_addr = None;

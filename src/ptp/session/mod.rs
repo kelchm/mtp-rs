@@ -10,8 +10,8 @@ mod streaming;
 pub use streaming::{receive_stream_to_stream, ReceiveStream};
 
 use crate::ptp::{
-    container_type, unpack_u32, CommandContainer, ContainerType, DataContainer, OperationCode,
-    ResponseCode, ResponseContainer, SessionId, TransactionId,
+    container_type, pack_u16, pack_u32, unpack_u32, CommandContainer, ContainerType, DataContainer,
+    OperationCode, ResponseCode, ResponseContainer, SessionId, TransactionId,
 };
 use crate::transport::Transport;
 use crate::Error;
@@ -60,6 +60,10 @@ pub struct PtpSession {
     /// Mutex to serialize operations (MTP only allows one operation at a time).
     /// Wrapped in Arc so it can be shared with ReceiveStream.
     pub(crate) operation_lock: Arc<Mutex<()>>,
+    /// Whether to send data container headers separately from payloads.
+    /// Some devices (e.g., Microsoft Zune) require the 12-byte PTP header
+    /// and data payload to arrive as separate USB bulk transfers.
+    split_header_data: bool,
 }
 
 impl PtpSession {
@@ -70,7 +74,17 @@ impl PtpSession {
             session_id,
             transaction_id: AtomicU32::new(TransactionId::FIRST.0),
             operation_lock: Arc::new(Mutex::new(())),
+            split_header_data: false,
         }
+    }
+
+    /// Enable split header/data mode for sending data containers.
+    ///
+    /// When enabled, the 12-byte PTP container header and payload are sent
+    /// as separate USB bulk transfers. Required by some devices (e.g.,
+    /// Microsoft Zune) that don't handle combined header+data transfers.
+    pub fn set_split_header_data(&mut self, split: bool) {
+        self.split_header_data = split;
     }
 
     /// Open a new session with the device.
@@ -177,8 +191,11 @@ impl PtpSession {
     // Core operation execution
     // =========================================================================
 
-    /// Execute an operation without data phase.
-    pub(crate) async fn execute(
+    /// Execute a raw PTP operation without data phase.
+    ///
+    /// This is useful for vendor-specific operations (e.g., MTPZ handshake)
+    /// that aren't covered by the high-level API.
+    pub async fn execute(
         &self,
         operation: OperationCode,
         params: &[u32],
@@ -210,8 +227,11 @@ impl PtpSession {
         Ok(response)
     }
 
-    /// Execute operation with data receive phase.
-    pub(crate) async fn execute_with_receive(
+    /// Execute a raw PTP operation with data receive phase.
+    ///
+    /// Returns the response container and the received data payload.
+    /// Useful for vendor-specific operations that return data.
+    pub async fn execute_with_receive(
         &self,
         operation: OperationCode,
         params: &[u32],
@@ -281,8 +301,11 @@ impl PtpSession {
         }
     }
 
-    /// Execute operation with data send phase.
-    pub(crate) async fn execute_with_send(
+    /// Execute a raw PTP operation with data send phase.
+    ///
+    /// Sends the provided data payload to the device as part of the operation.
+    /// Useful for vendor-specific operations that require sending data.
+    pub async fn execute_with_send(
         &self,
         operation: OperationCode,
         params: &[u32],
@@ -300,13 +323,31 @@ impl PtpSession {
         };
         self.transport.send_bulk(&cmd.to_bytes()).await?;
 
-        // Send data
+        // Send data container.
         let data_container = DataContainer {
             code: operation,
             transaction_id: tx_id,
             payload: data.to_vec(),
         };
-        self.transport.send_bulk(&data_container.to_bytes()).await?;
+
+        if self.split_header_data {
+            // Split mode: send 12-byte header and payload as separate USB
+            // bulk transfers. Required by some devices (e.g., Microsoft Zune).
+            let total_len = (HEADER_SIZE + data.len()) as u32;
+            let mut header = Vec::with_capacity(HEADER_SIZE);
+            header.extend_from_slice(&pack_u32(total_len));
+            header.extend_from_slice(&pack_u16(ContainerType::Data.to_code()));
+            header.extend_from_slice(&pack_u16(operation.into()));
+            header.extend_from_slice(&pack_u32(tx_id));
+            self.transport.send_bulk(&header).await?;
+            if !data.is_empty() {
+                self.transport.send_bulk(data).await?;
+            }
+        } else {
+            self.transport
+                .send_bulk(&data_container.to_bytes())
+                .await?;
+        }
 
         // Receive response
         let response_bytes = self.transport.receive_bulk(512).await?;
